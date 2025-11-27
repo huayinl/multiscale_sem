@@ -4,12 +4,21 @@ import cv2
 import numpy as np
 import torch
 from skimage.morphology import skeletonize
+import tempfile
+import shutil
+try:
+    import h5py
+    H5PY_AVAILABLE = True
+except Exception:
+    h5py = None
+    H5PY_AVAILABLE = False
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont
 from queue import Queue, Empty
+from collections import OrderedDict
 
 # --- Check for SAM 2 ---
 try:
@@ -200,10 +209,21 @@ class ImageLoader(QThread):
         # references (set by GUI) to lists/dicts owned by GUI
         self.image_files = None
         self.mask_files = None
+        # optional HDF5 reference
+        self.h5_path = None
+        self.h5_dataset = None
+        # internal HDF5 handle opened in this thread (open once for efficiency)
+        self._h5f = None
+        self._h5_n_frames = None
 
-    def set_references(self, image_files, mask_files):
+    def set_references(self, image_files=None, mask_files=None, h5_path=None, h5_dataset=None):
         self.image_files = image_files
         self.mask_files = mask_files
+        self.h5_path = h5_path
+        self.h5_dataset = h5_dataset
+        # reset per-thread HDF5 info; actual file handle will be opened inside run()
+        self._h5_n_frames = None
+        # if image_files given and it's a list, we keep it; otherwise None
 
     def request(self, idx):
         try:
@@ -223,15 +243,70 @@ class ImageLoader(QThread):
             if idx is None:
                 continue
             try:
-                if not self.image_files:
+                # Allow either file-based image list or HDF5-backed dataset
+                if self.image_files is None and self.h5_path is None:
+                    # nothing to load
                     continue
-                if idx < 0 or idx >= len(self.image_files):
-                    continue
-                path = self.image_files[idx]
-                img = cv2.imread(path)
-                if img is None:
-                    continue
-                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+                # If using HDF5, ensure we have dataset length and an open handle
+                if self.h5_path is not None:
+                    if not H5PY_AVAILABLE:
+                        continue
+                    # open HDF5 file once in this thread for efficiency
+                    if self._h5f is None:
+                        try:
+                            self._h5f = h5py.File(self.h5_path, 'r')
+                            ds_name = self.h5_dataset
+                            if ds_name is None:
+                                # pick the first dataset
+                                ds_name = next(iter(self._h5f.keys()))
+                            self._h5_dataset_name_internal = ds_name
+                            self._h5_n_frames = self._h5f[ds_name].shape[0]
+                        except Exception:
+                            # failed to open HDF5 in loader thread
+                            try:
+                                if self._h5f is not None:
+                                    self._h5f.close()
+                                self._h5f = None
+                            except Exception:
+                                pass
+                            continue
+
+                    # bounds check using HDF5 length
+                    if idx < 0 or (self._h5_n_frames is not None and idx >= self._h5_n_frames):
+                        continue
+
+                    try:
+                        ds = self._h5f[self._h5_dataset_name_internal]
+                        arr = np.asarray(ds[idx])
+                        # if grayscale expand to 3 channels
+                        if arr.ndim == 2:
+                            img_rgb = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                        elif arr.ndim == 3 and arr.shape[2] == 3:
+                            if arr.dtype != np.uint8:
+                                # normalize to 0-255
+                                arrf = arr.astype(np.float32)
+                                m = arrf.max()
+                                if m == 0:
+                                    img_rgb = (arrf * 0).astype(np.uint8)
+                                else:
+                                    img_rgb = (255.0 * (arrf / m)).astype(np.uint8)
+                            else:
+                                img_rgb = arr.astype(np.uint8)
+                        else:
+                            # unsupported shape
+                            continue
+                    except Exception:
+                        continue
+                else:
+                    # file-based images
+                    if idx < 0 or idx >= len(self.image_files):
+                        continue
+                    path = self.image_files[idx]
+                    img = cv2.imread(path)
+                    if img is None:
+                        continue
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
                 # compose mask if available
                 if self.mask_files and idx in self.mask_files:
@@ -258,7 +333,93 @@ class ImageLoader(QThread):
             self._req_q.put(None)
         except Exception:
             pass
+        # close any open HDF5 handle
+        try:
+            if getattr(self, '_h5f', None) is not None:
+                try:
+                    self._h5f.close()
+                except Exception:
+                    pass
+                self._h5f = None
+        except Exception:
+            pass
         self.wait()
+
+
+class ExportH5Worker(QThread):
+    """Export frames from an HDF5 dataset to a temporary folder as JPEGs.
+    Emits `finished(temp_folder)` when done, `progress(int)` updates, and `error(str)` on failure.
+    """
+    finished = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, h5_path, dataset_name=None):
+        super().__init__()
+        self.h5_path = h5_path
+        self.dataset_name = dataset_name
+
+    def run(self):
+        if not H5PY_AVAILABLE:
+            self.error.emit("h5py not available")
+            return
+        try:
+            with h5py.File(self.h5_path, 'r') as f:
+                ds_name = self.dataset_name
+                if ds_name is None:
+                    # pick preferred dataset names or first dataset
+                    for pref in ('images', 'frames', 'data'):
+                        if pref in f:
+                            ds_name = pref
+                            break
+                if ds_name is None:
+                    for k in f.keys():
+                        if isinstance(f[k], h5py.Dataset):
+                            ds_name = k
+                            break
+                if ds_name is None:
+                    self.error.emit('No dataset found in HDF5')
+                    return
+
+                ds = f[ds_name]
+                n_frames = ds.shape[0]
+                temp_dir = tempfile.mkdtemp(prefix='h5_frames_')
+                for i in range(n_frames):
+                    try:
+                        arr = np.asarray(ds[i])
+                        if arr.ndim == 2:
+                            out = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                        elif arr.ndim == 3 and arr.shape[2] == 3:
+                            if arr.dtype != np.uint8:
+                                # normalize to 0-255
+                                arrf = arr.astype(np.float32)
+                                m = arrf.max()
+                                if m == 0:
+                                    out = (arrf * 0).astype(np.uint8)
+                                else:
+                                    out = (255.0 * (arrf / m)).astype(np.uint8)
+                            else:
+                                out = arr.astype(np.uint8)
+                            # convert RGB->BGR if needed (assume RGB)
+                            out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+                        else:
+                            # unsupported dim
+                            continue
+
+                        save_path = os.path.join(temp_dir, f"{i}.jpg")
+                        cv2.imwrite(save_path, out, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        if i % max(1, n_frames // 100) == 0:
+                            pct = int(100.0 * (i+1) / n_frames)
+                            self.progress.emit(pct)
+                    except Exception:
+                        # skip problematic frames
+                        continue
+
+            self.finished.emit(temp_dir)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
 
 class C_Elegans_GUI(QMainWindow):
     def __init__(self):
@@ -272,6 +433,8 @@ class C_Elegans_GUI(QMainWindow):
         self.current_frame_idx = 0
         # store last loaded RGB full-resolution frame for coordinate mapping
         self._last_loaded_rgb = None
+        # hovered prompt point state: (obj_idx, point_idx) or None
+        self._hovered_point = None
         self.blob_centers = None # Stores result of Autosegment
         self.autoseg_frame_idx = None
         self.tracking_results = None # Stores result of SAM 2
@@ -282,8 +445,9 @@ class C_Elegans_GUI(QMainWindow):
         self._mask_cache = {}
         self._mask_cache_max = 64
         # Pixmap cache (scaled QPixmaps) for fast display
-        self.pixmap_cache = {}
-        self.pixmap_cache_max = 256
+        # Use OrderedDict for LRU behavior (most-recently-used at end)
+        self.pixmap_cache = OrderedDict()
+        self.pixmap_cache_max = 512
         # Prefetch radius (number of frames ahead/behind to load)
         self.prefetch_radius = 3
         # Playback state
@@ -320,6 +484,8 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.start()
         # initial references (empty) - will be updated when folder selected / tracking finished
         self._image_loader.set_references(self.image_files, self.tracking_mask_files)
+        # temp dir used when exporting HDF5 frames for tracking
+        self._h5_export_tempdir = None
 
     def setup_selection_screen(self):
         self.selection_widget = QWidget()
@@ -333,10 +499,78 @@ class C_Elegans_GUI(QMainWindow):
         btn_select.setFixedSize(200, 50)
         btn_select.clicked.connect(self.choose_folder)
 
+        btn_import_h5 = QPushButton("Import HDF5 File")
+        btn_import_h5.setFixedSize(200, 50)
+        btn_import_h5.clicked.connect(self.choose_hdf5)
+
         layout.addWidget(label)
         layout.addWidget(btn_select, alignment=Qt.AlignCenter)
+        layout.addWidget(btn_import_h5, alignment=Qt.AlignCenter)
         self.selection_widget.setLayout(layout)
         self.stacked_widget.addWidget(self.selection_widget)
+
+    def choose_hdf5(self):
+        if not H5PY_AVAILABLE:
+            QMessageBox.critical(self, "Error", "h5py is not installed. Please install h5py to import HDF5 files.")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Select HDF5 file", filter="HDF5 Files (*.h5 *.hdf5);;All Files (*)")
+        if not path:
+            return
+
+        # Attempt to inspect the file to find a suitable dataset
+        try:
+            with h5py.File(path, 'r') as f:
+                # prefer dataset named 'images' or 'frames', otherwise take first dataset
+                ds_name = None
+                for pref in ('images', 'frames', 'data'):
+                    if pref in f:
+                        ds_name = pref
+                        break
+                if ds_name is None:
+                    # pick first dataset
+                    for k in f.keys():
+                        if isinstance(f[k], h5py.Dataset):
+                            ds_name = k
+                            break
+                if ds_name is None:
+                    QMessageBox.critical(self, "Error", "No dataset found in HDF5 file.")
+                    return
+                n_frames = f[ds_name].shape[0]
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read HDF5 file: {e}")
+            return
+
+        # set up HDF5-backed dataset
+        self.video_path = None
+        self.image_files = None
+        self.h5_file_path = path
+        self.h5_dataset_name = ds_name
+
+        # configure slider and UI
+        self.slider.setMaximum(max(0, n_frames - 1))
+        self.slider.setEnabled(True)
+        self.btn_play.setEnabled(True)
+        self.stacked_widget.setCurrentIndex(1)
+
+        # update image loader references and clear caches
+        try:
+            self._image_loader.set_references(image_files=None, mask_files=self.tracking_mask_files, h5_path=self.h5_file_path, h5_dataset=self.h5_dataset_name)
+        except Exception:
+            pass
+        self.clear_pixmap_cache()
+        self.update_display()
+        # disable tracking (TrackerWorker expects a folder of frames)
+        try:
+            self.btn_track.setEnabled(False)
+        except Exception:
+            pass
+        self.status_label.setText(f"Loaded HDF5: {os.path.basename(path)} ({n_frames} frames)")
+        # Prefetch first frames
+        try:
+            self._image_loader.request(self.current_frame_idx)
+            self._prefetch_neighbors(self.current_frame_idx)
+        except Exception:
+            pass
 
     def setup_tracking_screen(self):
         self.tracking_widget = QWidget()
@@ -514,7 +748,70 @@ class C_Elegans_GUI(QMainWindow):
             except Exception:
                 pass
 
-            # ensure slider shows that frame and request the loader to (re)load it
+            # --- IMMEDIATE DRAW: render prompt points onto the just-segmented frame and display it
+            try:
+                # draw on a copy (BGR) so we can show markers immediately without waiting for the loader
+                img_bgr = img.copy()
+                circle_radius = 15
+                # bright red in BGR for selection highlight
+                gold_bgr = (0, 0, 255)
+                text_bgr = (255, 255, 255)
+                outline_bgr = (0, 0, 0)
+
+                for i_obj, skeleton_pts in enumerate(self.blob_centers):
+                    color_rgb = tuple(map(int, self.colors[(i_obj + 1) % len(self.colors)]))
+                    color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+                    is_selected = (self.selected_object_idx is not None and self.selected_object_idx == i_obj)
+                    for (cx, cy) in skeleton_pts:
+                        cx_i = int(cx)
+                        cy_i = int(cy)
+                        if is_selected:
+                            sel_radius = circle_radius + 12
+                            inner_radius = circle_radius + 4
+                            cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
+                            cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
+                            cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
+                            cv2.putText(img_bgr, str(i_obj+1), (cx_i+inner_radius+2, cy_i-inner_radius-2),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                        else:
+                            cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
+                            cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
+                            cv2.putText(img_bgr, str(i_obj+1), (cx_i+8, cy_i-8),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+
+                # convert back to RGB for Qt
+                img_rgb_now = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                img_rgb_now = np.ascontiguousarray(img_rgb_now)
+                h, w, ch = img_rgb_now.shape
+                bytes_per_line = ch * w
+                q_img_now = QImage(img_rgb_now.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                pixmap_now = QPixmap.fromImage(q_img_now)
+                scaled_now = pixmap_now.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+                # cache and show immediately
+                try:
+                    if len(self.pixmap_cache) >= self.pixmap_cache_max:
+                        try:
+                            self.pixmap_cache.popitem(last=False)
+                        except Exception:
+                            first_key = next(iter(self.pixmap_cache))
+                            self.pixmap_cache.pop(first_key, None)
+                except Exception:
+                    pass
+                self.pixmap_cache[target_idx] = scaled_now
+                try:
+                    self.pixmap_cache.move_to_end(target_idx, last=True)
+                except Exception:
+                    pass
+                self.image_label.setPixmap(scaled_now)
+            except Exception:
+                # fallback: request loader as before
+                try:
+                    self._image_loader.request(target_idx)
+                except Exception:
+                    pass
+
+            # ensure slider shows that frame and request the loader to (re)load it (for masks/prefetch)
             try:
                 self.slider.setValue(target_idx)
                 self._image_loader.request(target_idx)
@@ -530,19 +827,43 @@ class C_Elegans_GUI(QMainWindow):
 
     def run_tracking(self):
         if not SAM2_AVAILABLE:
-             QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
-             return
-             
-        self.btn_track.setEnabled(False)
-        self.btn_autosegment.setEnabled(False)
-        self.status_label.setText("Tracking in progress... This may take a moment.")
-        
-        # Run heavy lifting in a thread. Pass colors so worker can bake them into JPGs.
-        # This worker will write compressed JPG color masks to disk.
-        self.worker = TrackerWorker(self.video_path, self.device, self.blob_centers, colors=self.colors, model_size=getattr(self,'model_size','base'))
-        self.worker.finished.connect(self.on_tracking_finished)
-        self.worker.error.connect(self.on_tracking_error)
-        self.worker.start()
+            QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
+            return
+
+        # If dataset was loaded from HDF5, export frames to a temporary folder first
+        if getattr(self, 'h5_file_path', None) is not None:
+            # start export worker
+            try:
+                self.btn_track.setEnabled(False)
+                self.btn_autosegment.setEnabled(False)
+                self.status_label.setText("Exporting HDF5 frames to temporary folder...")
+                self._export_worker = ExportH5Worker(self.h5_file_path, getattr(self, 'h5_dataset_name', None))
+                self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
+                self._export_worker.finished.connect(self._on_h5_export_finished)
+                self._export_worker.error.connect(self.on_tracking_error)
+                self._export_worker.start()
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to start HDF5 export: {e}")
+                return
+
+        # normal folder-based tracking
+        self._start_tracker_worker(self.video_path)
+
+    def _start_tracker_worker(self, video_folder):
+        """Start the TrackerWorker using the given video_folder path."""
+        try:
+            self.btn_track.setEnabled(False)
+            self.btn_autosegment.setEnabled(False)
+            self.status_label.setText("Tracking in progress... This may take a moment.")
+            self.worker = TrackerWorker(video_folder, self.device, self.blob_centers, colors=self.colors, model_size=getattr(self, 'model_size', 'base'))
+            self.worker.finished.connect(self.on_tracking_finished)
+            self.worker.error.connect(self.on_tracking_error)
+            self.worker.start()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start tracker: {e}")
+            self.btn_track.setEnabled(True)
+            self.btn_autosegment.setEnabled(True)
 
     def _prefetch_neighbors(self, idx):
         # Request loading of current frame and neighbors
@@ -572,7 +893,8 @@ class C_Elegans_GUI(QMainWindow):
                 # Convert RGB->BGR for OpenCV drawing, then back to RGB
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
                 circle_radius = 15
-                gold_bgr = (0, 215, 255)
+                # bright red in BGR for selection highlight
+                gold_bgr = (0, 0, 255)
                 text_bgr = (255, 255, 255)
                 outline_bgr = (0, 0, 0)
 
@@ -585,16 +907,16 @@ class C_Elegans_GUI(QMainWindow):
                             cx_i = int(cx)
                             cy_i = int(cy)
                             if is_selected:
-                                # draw gold outer ring then inner filled color to emphasize selection
-                                sel_radius = circle_radius + 8
-                                inner_radius = circle_radius + 3
-                                cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
-                                cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
-                                cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 2)
-                                try:
-                                    cv2.putText(img_bgr, str(i_obj+1), (cx_i+inner_radius+2, cy_i-inner_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_bgr, 2, cv2.LINE_AA)
-                                except Exception:
-                                    pass
+                                # draw red outer ring then inner filled color to emphasize selection
+                                    sel_radius = circle_radius + 12
+                                    inner_radius = circle_radius + 4
+                                    cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
+                                    cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
+                                    cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
+                                    try:
+                                        cv2.putText(img_bgr, str(i_obj+1), (cx_i+inner_radius+2, cy_i-inner_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                                    except Exception:
+                                        pass
                             else:
                                 cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
                                 cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
@@ -614,11 +936,20 @@ class C_Elegans_GUI(QMainWindow):
 
             # cache scaled pixmap
             try:
-                if len(self.pixmap_cache) >= self.pixmap_cache_max:
-                    # drop oldest key
-                    first_key = next(iter(self.pixmap_cache))
-                    self.pixmap_cache.pop(first_key, None)
-                self.pixmap_cache[idx] = scaled_pixmap
+                    if len(self.pixmap_cache) >= self.pixmap_cache_max:
+                        try:
+                            # pop least-recently-used (first item)
+                            self.pixmap_cache.popitem(last=False)
+                        except Exception:
+                            # fallback: clear one item
+                            first_key = next(iter(self.pixmap_cache))
+                            self.pixmap_cache.pop(first_key, None)
+                    self.pixmap_cache[idx] = scaled_pixmap
+                    try:
+                        # mark as recently used
+                        self.pixmap_cache.move_to_end(idx, last=True)
+                    except Exception:
+                        pass
             except Exception:
                 self.pixmap_cache[idx] = scaled_pixmap
 
@@ -703,7 +1034,7 @@ class C_Elegans_GUI(QMainWindow):
 
         # update image loader references to include mask files
         try:
-            self._image_loader.set_references(self.image_files, self.tracking_mask_files)
+            self._image_loader.set_references(image_files=self.image_files, mask_files=self.tracking_mask_files, h5_path=getattr(self, 'h5_file_path', None), h5_dataset=getattr(self, 'h5_dataset_name', None))
         except Exception:
             pass
 
@@ -728,25 +1059,22 @@ class C_Elegans_GUI(QMainWindow):
         self.update_display()
 
     def eventFilter(self, obj, event):
-        # Capture Ctrl+LeftClick on the image_label to add a new single-point object (only on first frame)
+        # handle hover and clicks on the image label
         try:
-            if obj == self.image_label and event.type() == QEvent.MouseButtonPress:
-                # only respond to left-click + Ctrl
-                if event.button() == Qt.LeftButton and (event.modifiers() & Qt.ControlModifier):
-                    # only allow adding on the first frame as requested
-                    if self.current_frame_idx != 0:
-                        self.status_label.setText("Ctrl+Click additions only allowed on first frame.")
-                        return True
-
-                    # get displayed pixmap and mapping info
+            if obj == self.image_label:
+                # Mouse move: detect hover over any plotted prompt point
+                if event.type() == QEvent.MouseMove:
+                    # reset hover
+                    self._hovered_point = None
                     pixmap = self.image_label.pixmap()
-                    if pixmap is None:
+                    if pixmap is None or not self.blob_centers:
+                        self.image_label.setCursor(Qt.ArrowCursor)
                         return False
+
                     label_w = self.image_label.width()
                     label_h = self.image_label.height()
                     pixmap_w = pixmap.width()
                     pixmap_h = pixmap.height()
-                    # compute offsets for centered pixmap
                     offset_x = max(0, (label_w - pixmap_w) // 2)
                     offset_y = max(0, (label_h - pixmap_h) // 2)
 
@@ -754,44 +1082,206 @@ class C_Elegans_GUI(QMainWindow):
                     x_in = pos.x() - offset_x
                     y_in = pos.y() - offset_y
                     if x_in < 0 or y_in < 0 or x_in >= pixmap_w or y_in >= pixmap_h:
+                        self.image_label.setCursor(Qt.ArrowCursor)
+                        return False
+
+                    # get original image size
+                    try:
+                        if self._last_loaded_rgb is not None:
+                            orig_h, orig_w = self._last_loaded_rgb.shape[:2]
+                        elif getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
+                            try:
+                                with h5py.File(self.h5_file_path, 'r') as f:
+                                    ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
+                                    arr = f[ds][self.current_frame_idx]
+                                    tmp = np.asarray(arr)
+                                    orig_h, orig_w = tmp.shape[:2]
+                            except Exception:
+                                self.image_label.setCursor(Qt.ArrowCursor)
+                                return False
+                        else:
+                            orig = cv2.imread(self.image_files[self.current_frame_idx])
+                            orig_h, orig_w = orig.shape[:2]
+                    except Exception:
+                        self.image_label.setCursor(Qt.ArrowCursor)
+                        return False
+
+                    # compute scale from original->pixmap (preserve aspect ratio so scales equal)
+                    scale_x = pixmap_w / float(orig_w)
+                    scale_y = pixmap_h / float(orig_h)
+                    scale = min(scale_x, scale_y)
+
+                    # threshold in display pixels for selecting a point
+                    thr = 12
+                    found = False
+                    # iterate over all points to find nearest
+                    for obj_idx, pts in enumerate(self.blob_centers):
+                        for pt_idx, (cx, cy) in enumerate(pts):
+                            disp_x = int(cx * scale) + offset_x
+                            disp_y = int(cy * scale) + offset_y
+                            dx = disp_x - pos.x()
+                            dy = disp_y - pos.y()
+                            if dx*dx + dy*dy <= thr*thr:
+                                self._hovered_point = (obj_idx, pt_idx)
+                                self.image_label.setCursor(Qt.PointingHandCursor)
+                                found = True
+                                break
+                        if found:
+                            break
+                    if not found:
+                        self.image_label.setCursor(Qt.ArrowCursor)
+                    return False
+
+                # Mouse button press: handle different click behaviors
+                if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                    # Ctrl+Left: add new object at click (existing behavior)
+                    if (event.modifiers() & Qt.ControlModifier):
+                        # only allow adding on the first frame
+                        if self.current_frame_idx != 0:
+                            self.status_label.setText("Ctrl+Click additions only allowed on first frame.")
+                            return True
+
+                        pixmap = self.image_label.pixmap()
+                        if pixmap is None:
+                            return False
+                        label_w = self.image_label.width()
+                        label_h = self.image_label.height()
+                        pixmap_w = pixmap.width()
+                        pixmap_h = pixmap.height()
+                        offset_x = max(0, (label_w - pixmap_w) // 2)
+                        offset_y = max(0, (label_h - pixmap_h) // 2)
+
+                        pos = event.pos()
+                        x_in = pos.x() - offset_x
+                        y_in = pos.y() - offset_y
+                        if x_in < 0 or y_in < 0 or x_in >= pixmap_w or y_in >= pixmap_h:
+                            return True
+
+                        if self._last_loaded_rgb is None:
+                            try:
+                                if getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
+                                    with h5py.File(self.h5_file_path, 'r') as f:
+                                        ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
+                                        arr = f[ds][0]
+                                        tmp = np.asarray(arr)
+                                        orig_h, orig_w = tmp.shape[:2]
+                                else:
+                                    orig = cv2.imread(self.image_files[0])
+                                    if orig is None:
+                                        return True
+                                    orig_h, orig_w = orig.shape[:2]
+                            except Exception:
+                                return True
+                        else:
+                            orig_h, orig_w = self._last_loaded_rgb.shape[:2]
+
+                        x_orig = int((x_in * orig_w) / pixmap_w)
+                        y_orig = int((y_in * orig_h) / pixmap_h)
+
+                        if self.blob_centers is None:
+                            self.blob_centers = []
+                        self.blob_centers.append([(x_orig, y_orig)])
+                        self.autoseg_frame_idx = 0
+                        try:
+                            self.update_object_sidebar()
+                            self._image_loader.request(0)
+                            self._prefetch_neighbors(0)
+                            self.slider.setValue(0)
+                            self.update_display()
+                            self.status_label.setText(f"Added object at ({x_orig},{y_orig})")
+                        except Exception:
+                            pass
                         return True
 
-                    # map to original image coordinates using last loaded full-res image
-                    if self._last_loaded_rgb is None:
-                        # try to load the first frame directly
+                    # Left click without Ctrl: if hovering on a point -> delete that point
+                    if self._hovered_point is not None:
+                        obj_idx, pt_idx = self._hovered_point
                         try:
-                            orig = cv2.imread(self.image_files[0])
-                            if orig is None:
-                                return True
-                            orig_h, orig_w = orig.shape[:2]
+                            if 0 <= obj_idx < len(self.blob_centers) and 0 <= pt_idx < len(self.blob_centers[obj_idx]):
+                                self.blob_centers[obj_idx].pop(pt_idx)
+                                # if no points left for object, remove object entirely
+                                if len(self.blob_centers[obj_idx]) == 0:
+                                    self.blob_centers.pop(obj_idx)
+                                    # adjust selected index
+                                    if self.selected_object_idx is not None:
+                                        if self.selected_object_idx == obj_idx:
+                                            self.selected_object_idx = None
+                                        elif self.selected_object_idx > obj_idx:
+                                            self.selected_object_idx -= 1
+                        except Exception:
+                            pass
+
+                        # refresh UI (invalidate cache and request recomposition)
+                        try:
+                            self.update_object_sidebar()
+                            if self.current_frame_idx in self.pixmap_cache:
+                                self.pixmap_cache.pop(self.current_frame_idx, None)
+                            self._image_loader.request(self.current_frame_idx)
+                            self._prefetch_neighbors(self.current_frame_idx)
+                            self.update_display()
+                            self.status_label.setText("Deleted prompt point")
+                        except Exception:
+                            pass
+                        return True
+
+                    # Left click without Ctrl and not on a point: if an object is selected, add a prompt point to that object
+                    if self.selected_object_idx is not None and self.blob_centers is not None and self.current_frame_idx == (self.autoseg_frame_idx or self.current_frame_idx):
+                        pixmap = self.image_label.pixmap()
+                        if pixmap is None:
+                            return False
+                        label_w = self.image_label.width()
+                        label_h = self.image_label.height()
+                        pixmap_w = pixmap.width()
+                        pixmap_h = pixmap.height()
+                        offset_x = max(0, (label_w - pixmap_w) // 2)
+                        offset_y = max(0, (label_h - pixmap_h) // 2)
+
+                        pos = event.pos()
+                        x_in = pos.x() - offset_x
+                        y_in = pos.y() - offset_y
+                        if x_in < 0 or y_in < 0 or x_in >= pixmap_w or y_in >= pixmap_h:
+                            return True
+
+                        # original image size
+                        try:
+                            if self._last_loaded_rgb is not None and self.current_frame_idx == self.current_frame_idx:
+                                orig_h, orig_w = self._last_loaded_rgb.shape[:2]
+                            elif getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
+                                with h5py.File(self.h5_file_path, 'r') as f:
+                                    ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
+                                    arr = f[ds][self.current_frame_idx]
+                                    tmp = np.asarray(arr)
+                                    orig_h, orig_w = tmp.shape[:2]
+                            else:
+                                orig = cv2.imread(self.image_files[self.current_frame_idx])
+                                orig_h, orig_w = orig.shape[:2]
                         except Exception:
                             return True
-                    else:
-                        orig_h, orig_w = self._last_loaded_rgb.shape[:2]
 
-                    x_orig = int((x_in * orig_w) / pixmap_w)
-                    y_orig = int((y_in * orig_h) / pixmap_h)
+                        x_orig = int((x_in * orig_w) / pixmap_w)
+                        y_orig = int((y_in * orig_h) / pixmap_h)
 
-                    # add new object as a single-point skeleton list
-                    if self.blob_centers is None:
-                        self.blob_centers = []
-                    self.blob_centers.append([(x_orig, y_orig)])
+                        try:
+                            # append to selected object's prompt list
+                            self.blob_centers[self.selected_object_idx].append((x_orig, y_orig))
+                        except Exception:
+                            # if selected index invalid, ignore
+                            return True
 
-                    # ensure autoseg frame index is 0 so markers are drawn
-                    self.autoseg_frame_idx = 0
+                        # refresh UI (invalidate cache and request recomposition)
+                        try:
+                            self.update_object_sidebar()
+                            if self.current_frame_idx in self.pixmap_cache:
+                                self.pixmap_cache.pop(self.current_frame_idx, None)
+                            self._image_loader.request(self.current_frame_idx)
+                            self._prefetch_neighbors(self.current_frame_idx)
+                            self.update_display()
+                            self.status_label.setText(f"Added prompt to object {self.selected_object_idx+1}")
+                        except Exception:
+                            pass
+                        return True
 
-                    # Refresh sidebar and display
-                    try:
-                        self.update_object_sidebar()
-                        self._image_loader.request(0)
-                        self._prefetch_neighbors(0)
-                        self.slider.setValue(0)
-                        self.update_display()
-                        self.status_label.setText(f"Added object at ({x_orig},{y_orig})")
-                    except Exception:
-                        pass
-
-                    return True
+                # end mouse press handling
         except Exception:
             pass
         return super().eventFilter(obj, event)
@@ -811,6 +1301,15 @@ class C_Elegans_GUI(QMainWindow):
                     pass
         except Exception:
             pass
+        # remove temporary exported HDF5 frames if present
+        try:
+            if getattr(self, '_h5_export_tempdir', None):
+                try:
+                    shutil.rmtree(self._h5_export_tempdir)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def on_tracking_error(self, err_msg):
@@ -818,6 +1317,17 @@ class C_Elegans_GUI(QMainWindow):
         self.status_label.setText("Tracking Failed.")
         self.btn_track.setEnabled(True)
         self.btn_autosegment.setEnabled(True)
+
+    def _on_h5_export_finished(self, temp_folder):
+        """Called when ExportH5Worker finishes exporting frames to `temp_folder`."""
+        try:
+            self._h5_export_tempdir = temp_folder
+            # start tracker with the exported folder
+            self._start_tracker_worker(temp_folder)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start tracker after export: {e}")
+            self.btn_track.setEnabled(True)
+            self.btn_autosegment.setEnabled(True)
 
     def clear_layout(self, layout):
         """Remove all widgets from a layout."""
@@ -835,6 +1345,8 @@ class C_Elegans_GUI(QMainWindow):
                 child_layout = item.layout()
                 if child_layout is not None:
                     self.clear_layout(child_layout)
+
+    # overlay helper was removed per user request
 
     def update_object_sidebar(self):
         """Populate the right-hand sidebar with one colored button per detected object."""
@@ -904,17 +1416,94 @@ class C_Elegans_GUI(QMainWindow):
                 text_color = '#000000' if luminance > 180 else '#FFFFFF'
                 if i == idx:
                     # highlighted border
-                    btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; border: 3px solid #FFD700; border-radius: 6px;")
+                    btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; border: 3px solid #FFD700; border-radius: 15px;")
                 else:
                     btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; border-radius: 6px;")
             except Exception:
                 pass
 
-        # Request a redraw of the autoseg frame so selection is visible on image
+        # Determine which frame to refresh (autoseg frame preferred)
+        target = self.autoseg_frame_idx if self.autoseg_frame_idx is not None else self.current_frame_idx
+
+        # Invalidate any existing scaled pixmap for that frame so update_display won't reuse stale image
         try:
-            target = self.autoseg_frame_idx if self.autoseg_frame_idx is not None else self.current_frame_idx
-            self._image_loader.request(target)
+            if target in self.pixmap_cache:
+                self.pixmap_cache.pop(target, None)
+        except Exception:
+            pass
+
+        # Try to draw selection immediately from the last full-resolution RGB we have
+        drawn_immediately = False
+        try:
+            if self._last_loaded_rgb is not None and target == self.current_frame_idx:
+                # Work on a copy (BGR) and draw selection markers as in _on_frame_loaded/run_autosegmentation
+                try:
+                    img_rgb = self._last_loaded_rgb.copy()
+                    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                    circle_radius = 15
+                    # bright red in BGR for selection highlight
+                    gold_bgr = (0, 0, 255)
+                    text_bgr = (255, 255, 255)
+                    outline_bgr = (0, 0, 0)
+
+                    for i_obj, skeleton_pts in enumerate(self.blob_centers or []):
+                        is_selected = (self.selected_object_idx is not None and self.selected_object_idx == i_obj)
+                        color_rgb = tuple(map(int, self.colors[(i_obj + 1) % len(self.colors)]))
+                        color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+                        for (cx, cy) in skeleton_pts:
+                            cx_i = int(cx)
+                            cy_i = int(cy)
+                            if is_selected:
+                                sel_radius = circle_radius + 12
+                                inner_radius = circle_radius + 4
+                                cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
+                                cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
+                                cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
+                                cv2.putText(img_bgr, str(i_obj+1), (cx_i+inner_radius+2, cy_i-inner_radius-2),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                            else:
+                                cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
+                                cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
+                                cv2.putText(img_bgr, str(i_obj+1), (cx_i+8, cy_i-8),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+
+                    img_rgb_now = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    img_rgb_now = np.ascontiguousarray(img_rgb_now)
+                    h, w, ch = img_rgb_now.shape
+                    bytes_per_line = ch * w
+                    q_img_now = QImage(img_rgb_now.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                    pixmap_now = QPixmap.fromImage(q_img_now)
+                    scaled_now = pixmap_now.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+                    # cache and show immediately
+                    try:
+                        if len(self.pixmap_cache) >= self.pixmap_cache_max:
+                            try:
+                                self.pixmap_cache.popitem(last=False)
+                            except Exception:
+                                first_key = next(iter(self.pixmap_cache))
+                                self.pixmap_cache.pop(first_key, None)
+                    except Exception:
+                        pass
+                    self.pixmap_cache[target] = scaled_now
+                    try:
+                        self.pixmap_cache.move_to_end(target, last=True)
+                    except Exception:
+                        pass
+                    if target == self.current_frame_idx:
+                        self.image_label.setPixmap(scaled_now)
+                    drawn_immediately = True
+                except Exception:
+                    drawn_immediately = False
+        except Exception:
+            drawn_immediately = False
+
+        # If immediate draw failed, request the background loader to recompose this frame (with masks) and update when done
+        try:
+            if not drawn_immediately:
+                self._image_loader.request(target)
             self._prefetch_neighbors(target)
+            # ensure update_display will not immediately reuse old cached pixmap (we popped it above)
             self.update_display()
         except Exception:
             pass
@@ -946,6 +1535,12 @@ class C_Elegans_GUI(QMainWindow):
             # ensure autoseg frame redraw
             if self.autoseg_frame_idx is None:
                 self.autoseg_frame_idx = self.current_frame_idx
+            # invalidate cached scaled pixmap so update_display won't reuse stale image
+            try:
+                if self.current_frame_idx in self.pixmap_cache:
+                    self.pixmap_cache.pop(self.current_frame_idx, None)
+            except Exception:
+                pass
             self._image_loader.request(self.autoseg_frame_idx)
             self._prefetch_neighbors(self.autoseg_frame_idx)
             self.update_display()
@@ -953,12 +1548,19 @@ class C_Elegans_GUI(QMainWindow):
             pass
 
     def update_display(self):
-        if not self.image_files:
+        # allow HDF5-backed datasets as well as file lists
+        if not self.image_files and not getattr(self, 'h5_file_path', None):
             return
         # If we have a cached scaled pixmap for this frame, use it immediately
         if self.current_frame_idx in self.pixmap_cache:
             try:
-                self.image_label.setPixmap(self.pixmap_cache[self.current_frame_idx])
+                pm = self.pixmap_cache[self.current_frame_idx]
+                # update LRU ordering
+                try:
+                    self.pixmap_cache.move_to_end(self.current_frame_idx, last=True)
+                except Exception:
+                    pass
+                self.image_label.setPixmap(pm)
             except Exception:
                 pass
             return

@@ -176,9 +176,12 @@ class TrackerWorker(QThread):
             
             # 3. Add Prompts
             for i, prompts in enumerate(self.scaled_blob_centers):
+                if not prompts:
+                    continue
                 ann_obj_id = i + 1
-                points = np.array(prompts, dtype=np.float32)
-                labels = np.ones(points.shape[0], dtype=np.int32)
+                # prompts is a list of ((x, y), label) tuples
+                points = np.array([pt for pt, _ in prompts], dtype=np.float32)
+                labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
                 predictor.add_new_points_or_box(
                     inference_state=inference_state,
                     frame_idx=0, # 0 in the temporary folder
@@ -608,9 +611,12 @@ class RealTimeTrackerWorker(QThread):
             predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
             inference_state = predictor.init_state(video_path=self.video_path)
             for i, prompts in enumerate(self.scaled_blob_centers):
+                if not prompts:
+                    continue
                 ann_obj_id = i + 1
-                points = np.array(prompts, dtype=np.float32)
-                labels = np.ones(points.shape[0], dtype=np.int32)
+                # prompts is a list of ((x, y), label) tuples
+                points = np.array([pt for pt, _ in prompts], dtype=np.float32)
+                labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
                 predictor.add_new_points_or_box(
                     inference_state=inference_state,
                     frame_idx=0,
@@ -678,7 +684,8 @@ class C_Elegans_GUI(QMainWindow):
         # hovered prompt point state: (obj_idx, point_idx) or None
         self._hovered_point = None
         # Prompts storage: object-centric mapping
-        # obj_id -> {frame_idx -> [(x,y), (x,y), ...], ...}
+        # obj_id -> {frame_idx -> [((x,y), label), ((x,y), label), ...], ...}
+        # where label is 1 (positive) or 0 (negative)
         self.prompts_by_object = {}
         # Keep track of next object ID to assign
         self.next_object_id = 0
@@ -858,7 +865,9 @@ class C_Elegans_GUI(QMainWindow):
         return self.prompts_by_object[obj_id].get(frame_idx, [])
 
     def set_prompts_for_object_in_frame(self, obj_id, frame_idx, prompts):
-        """Set prompts for a specific object in a specific frame."""
+        """Set prompts for a specific object in a specific frame.
+        prompts: list of ((x, y), label) tuples where label is 1 (positive) or 0 (negative)
+        """
         if obj_id not in self.prompts_by_object:
             self.prompts_by_object[obj_id] = {}
         self.prompts_by_object[obj_id][frame_idx] = prompts
@@ -1108,6 +1117,7 @@ class C_Elegans_GUI(QMainWindow):
         # object buttons state
         self.object_buttons = []
         self.selected_object_idx = None
+        self.selected_prompt_mode = 1  # 1 for positive (+), 0 for negative (-)
 
         self.tracking_widget.setLayout(layout)
         self.stacked_widget.addWidget(self.tracking_widget)
@@ -1264,8 +1274,10 @@ class C_Elegans_GUI(QMainWindow):
         try:
             prompts = process_image_and_scale_centers(img, downsample_resolution=8, num_skeleton_points=10)
             # store prompts as separate objects (one per detected worm)
+            # wrap each coordinate as ((x, y), 1) for positive prompts
             for i, skeleton_pts in enumerate(prompts):
-                self.create_new_object(target_idx, [skeleton_pts])
+                labeled_prompts = [((x, y), 1) for x, y in skeleton_pts]
+                self.create_new_object(target_idx, labeled_prompts)
             # mark which frame these prompts belong to
             self.autoseg_frame_idx = target_idx
 
@@ -1291,31 +1303,58 @@ class C_Elegans_GUI(QMainWindow):
                 # draw on a copy (BGR) so we can show markers immediately without waiting for the loader
                 img_bgr = img.copy()
                 circle_radius = 15
+                x_size = 18
                 # bright red in BGR for selection highlight
                 gold_bgr = (0, 0, 255)
                 text_bgr = (255, 255, 255)
                 outline_bgr = (0, 0, 0)
 
-                for i_obj, skeleton_pts in enumerate(curr_prompts):
-                    color_rgb = tuple(map(int, self.colors[(i_obj + 1) % len(self.colors)]))
+                # Iterate over all objects that have prompts in target frame
+                for obj_id in self.get_all_object_ids():
+                    skeleton_pts = self.get_prompts_for_object_in_frame(obj_id, target_idx)
+                    if not skeleton_pts:
+                        continue
+                    color_rgb = tuple(map(int, self.colors[(obj_id + 1) % len(self.colors)]))
                     color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
-                    is_selected = (self.selected_object_idx is not None and self.selected_object_idx == i_obj)
-                    for (cx, cy) in skeleton_pts:
+                    is_selected = (self.selected_object_idx is not None and self.selected_object_idx == obj_id)
+                    
+                    for ((cx, cy), label) in skeleton_pts:
                         cx_i = int(cx)
                         cy_i = int(cy)
-                        if is_selected:
-                            sel_radius = circle_radius + 12
-                            inner_radius = circle_radius + 4
-                            cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
-                            cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
-                            cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
-                            cv2.putText(img_bgr, str(i_obj+1), (cx_i+inner_radius+2, cy_i-inner_radius-2),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                        
+                        if label == 1:
+                            # Positive prompt: draw circle
+                            if is_selected:
+                                sel_radius = circle_radius + 12
+                                inner_radius = circle_radius + 4
+                                cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
+                                cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
+                                cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
+                                cv2.putText(img_bgr, str(obj_id+1), (cx_i+inner_radius+2, cy_i-inner_radius-2),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                            else:
+                                cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
+                                cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
+                                cv2.putText(img_bgr, str(obj_id+1), (cx_i+8, cy_i-8),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
                         else:
-                            cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
-                            cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
-                            cv2.putText(img_bgr, str(i_obj+1), (cx_i+8, cy_i-8),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+                            # Negative prompt: draw X
+                            if is_selected:
+                                x_half = x_size + 8
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), gold_bgr, 8)
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), gold_bgr, 8)
+                                cv2.line(img_bgr, (cx_i - x_half + 4, cy_i - x_half + 4), (cx_i + x_half - 4, cy_i + x_half - 4), color_bgr, 6)
+                                cv2.line(img_bgr, (cx_i - x_half + 4, cy_i + x_half - 4), (cx_i + x_half - 4, cy_i - x_half + 4), color_bgr, 6)
+                                cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                            else:
+                                x_half = x_size // 2
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), color_bgr, 4)
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), color_bgr, 4)
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), outline_bgr, 1)
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), outline_bgr, 1)
+                                cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
 
                 # convert back to RGB for Qt
                 img_rgb_now = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -1592,10 +1631,11 @@ class C_Elegans_GUI(QMainWindow):
             has_prompts = any(len(self.get_prompts_for_object_in_frame(obj_id, idx)) > 0 for obj_id in all_obj_ids)
             
             if has_prompts:
-                # Draw filled circles and labels so markers are visible over masks
+                # Draw filled circles for positive and X markers for negative prompts
                 # Convert RGB->BGR for OpenCV drawing, then back to RGB
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
                 circle_radius = 15
+                x_size = 18
                 # bright red in BGR for selection highlight
                 gold_bgr = (0, 0, 255)
                 text_bgr = (255, 255, 255)
@@ -1609,27 +1649,53 @@ class C_Elegans_GUI(QMainWindow):
                         is_selected = (self.selected_object_idx is not None and self.selected_object_idx == obj_id)
                         color_rgb = tuple(map(int, self.colors[(obj_id + 1) % len(self.colors)]))
                         color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
-                        for (cx, cy) in skeleton_pts:
+                        for ((cx, cy), label) in skeleton_pts:
                             cx_i = int(cx)
                             cy_i = int(cy)
-                            if is_selected:
-                                # draw red outer ring then inner filled color to emphasize selection
-                                sel_radius = circle_radius + 12
-                                inner_radius = circle_radius + 4
-                                cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
-                                cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
-                                cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
-                                try:
-                                    cv2.putText(img_bgr, str(obj_id+1), (cx_i+inner_radius+2, cy_i-inner_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
-                                except Exception:
-                                    pass
+                            
+                            if label == 1:
+                                # Positive prompt: draw circle
+                                if is_selected:
+                                    # draw red outer ring then inner filled color to emphasize selection
+                                    sel_radius = circle_radius + 12
+                                    inner_radius = circle_radius + 4
+                                    cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
+                                    cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
+                                    cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
+                                    try:
+                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+inner_radius+2, cy_i-inner_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                                    except Exception:
+                                        pass
+                                else:
+                                    cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
+                                    cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
+                                    try:
+                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+8, cy_i-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+                                    except Exception:
+                                        pass
                             else:
-                                cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
-                                cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
-                                try:
-                                    cv2.putText(img_bgr, str(obj_id+1), (cx_i+8, cy_i-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
-                                except Exception:
-                                    pass
+                                # Negative prompt: draw X
+                                if is_selected:
+                                    # draw thick X with gold outline
+                                    x_half = x_size + 8
+                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), gold_bgr, 8)
+                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), gold_bgr, 8)
+                                    cv2.line(img_bgr, (cx_i - x_half + 4, cy_i - x_half + 4), (cx_i + x_half - 4, cy_i + x_half - 4), color_bgr, 6)
+                                    cv2.line(img_bgr, (cx_i - x_half + 4, cy_i + x_half - 4), (cx_i + x_half - 4, cy_i - x_half + 4), color_bgr, 6)
+                                    try:
+                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                                    except Exception:
+                                        pass
+                                else:
+                                    x_half = x_size // 2
+                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), color_bgr, 4)
+                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), color_bgr, 4)
+                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), outline_bgr, 1)
+                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), outline_bgr, 1)
+                                    try:
+                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+                                    except Exception:
+                                        pass
                     except Exception:
                         continue
                 # convert back to RGB for Qt
@@ -1992,7 +2058,7 @@ class C_Elegans_GUI(QMainWindow):
                     found = False
                     # iterate over all points to find nearest
                     for obj_idx, pts in enumerate(prompts):
-                        for pt_idx, (cx, cy) in enumerate(pts):
+                        for pt_idx, ((cx, cy), label) in enumerate(pts):
                             disp_x = int(cx * scale) + offset_x
                             disp_y = int(cy * scale) + offset_y
                             dx = disp_x - pos.x()
@@ -2051,8 +2117,8 @@ class C_Elegans_GUI(QMainWindow):
                         x_orig = int((x_in * orig_w) / pixmap_w)
                         y_orig = int((y_in * orig_h) / pixmap_h)
 
-                        # create new object with initial prompt at current frame
-                        new_obj_id = self.create_new_object(self.current_frame_idx, [(x_orig, y_orig)])
+                        # create new object with initial prompt at current frame (positive by default)
+                        new_obj_id = self.create_new_object(self.current_frame_idx, [((x_orig, y_orig), 1)])
                         self.autoseg_frame_idx = self.current_frame_idx
                         try:
                             self.update_object_sidebar()
@@ -2132,9 +2198,9 @@ class C_Elegans_GUI(QMainWindow):
                         y_orig = int((y_in * orig_h) / pixmap_h)
 
                         try:
-                            # append to selected object's prompt list for current frame
+                            # append to selected object's prompt list for current frame with current mode
                             current_prompts = self.get_prompts_for_object_in_frame(self.selected_object_idx, self.current_frame_idx)
-                            current_prompts.append((x_orig, y_orig))
+                            current_prompts.append(((x_orig, y_orig), self.selected_prompt_mode))
                             self.set_prompts_for_object_in_frame(self.selected_object_idx, self.current_frame_idx, current_prompts)
                         except Exception:
                             # if selected index invalid, ignore
@@ -2303,7 +2369,7 @@ class C_Elegans_GUI(QMainWindow):
     # overlay helper was removed per user request
 
     def update_object_sidebar(self):
-        """Populate the right-hand sidebar with one colored button per object across all frames."""
+        """Populate the right-hand sidebar with + and - buttons per object."""
         # Clear existing buttons
         try:
             self.clear_layout(self.object_button_layout)
@@ -2317,7 +2383,7 @@ class C_Elegans_GUI(QMainWindow):
             lbl = QLabel("No objects detected")
             self.object_button_layout.addWidget(lbl)
         else:
-            # create a row for each object: [Object btn] [Delete btn]
+            # create a row for each object: [+btn] [-btn] [Delete btn]
             for obj_id in all_object_ids:
                 # Get prompts for this object in current frame (may be empty)
                 prompts_here = self.get_prompts_for_object_in_frame(obj_id, self.current_frame_idx)
@@ -2328,14 +2394,7 @@ class C_Elegans_GUI(QMainWindow):
 
                 # Show number of prompts in this frame for this object
                 num_prompts = len(prompts_here)
-                btn_label = f"Worm {obj_id + 1}"
-                if num_prompts > 0:
-                    btn_label += f" ({num_prompts})"
                 
-                btn = QPushButton(btn_label)
-                btn.setFixedHeight(30)
-                btn.setMinimumWidth(140)
-
                 # color chosen in same way as drawing code (use object id +1)
                 color_rgb = tuple(map(int, self.colors[(obj_id + 1) % len(self.colors)]))
                 r, g, b = color_rgb
@@ -2344,9 +2403,27 @@ class C_Elegans_GUI(QMainWindow):
                 luminance = 0.299 * r + 0.587 * g + 0.114 * b
                 text_color = '#000000' if luminance > 180 else '#FFFFFF'
 
-                base_style = f"background-color: rgb({r},{g},{b}); color: {text_color}; border-radius: 6px;"
-                btn.setStyleSheet(base_style)
-                btn.clicked.connect(lambda _, oid=obj_id: self.on_object_button_clicked(oid))
+                # Label showing object name and count
+                label_text = f"W{obj_id + 1}"
+                if num_prompts > 0:
+                    label_text += f" ({num_prompts})"
+                obj_label = QLabel(label_text)
+                obj_label.setStyleSheet(f"color: rgb({r},{g},{b}); font-weight: bold; font-size: 12px;")
+                obj_label.setFixedWidth(50)
+                
+                # + button for positive prompts
+                btn_plus = QPushButton("+")
+                btn_plus.setFixedSize(35, 30)
+                base_style_plus = f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;"
+                btn_plus.setStyleSheet(base_style_plus)
+                btn_plus.clicked.connect(lambda _, oid=obj_id: self.on_object_button_clicked(oid, mode=1))
+
+                # - button for negative prompts
+                btn_minus = QPushButton("-")
+                btn_minus.setFixedSize(35, 30)
+                base_style_minus = f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;"
+                btn_minus.setStyleSheet(base_style_minus)
+                btn_minus.clicked.connect(lambda _, oid=obj_id: self.on_object_button_clicked(oid, mode=0))
 
                 # delete button
                 del_btn = QPushButton("✕")
@@ -2354,11 +2431,14 @@ class C_Elegans_GUI(QMainWindow):
                 del_btn.setStyleSheet("background-color: #ff4d4d; color: #fff; border-radius: 4px;")
                 del_btn.clicked.connect(lambda _, oid=obj_id: self.delete_object(oid))
 
-                row_layout.addWidget(btn)
+                row_layout.addWidget(obj_label)
+                row_layout.addWidget(btn_plus)
+                row_layout.addWidget(btn_minus)
                 row_layout.addWidget(del_btn)
                 row_widget.setLayout(row_layout)
 
-                self.object_buttons.append(btn)
+                # Store both buttons for highlighting
+                self.object_buttons.append((obj_id, btn_plus, btn_minus))
                 self.object_button_layout.addWidget(row_widget)
 
         # add stretch to push buttons to top
@@ -2378,26 +2458,34 @@ class C_Elegans_GUI(QMainWindow):
         except Exception:
             pass
 
-    def on_object_button_clicked(self, obj_id):
-        """Handle object button click: mark selected and update UI."""
+    def on_object_button_clicked(self, obj_id, mode=1):
+        """Handle object button click: mark selected object and mode (+ or -)."""
         self.selected_object_idx = obj_id
-        self.status_label.setText(f"Selected object {obj_id+1}")
+        self.selected_prompt_mode = mode  # 1 for positive, 0 for negative
+        mode_str = "positive (+)" if mode == 1 else "negative (-)"
+        self.status_label.setText(f"Selected object {obj_id+1} - {mode_str} mode")
 
         # update visual highlight for buttons
-        all_obj_ids = self.get_all_object_ids()
-        for i, btn in enumerate(self.object_buttons):
+        for obj_id_stored, btn_plus, btn_minus in self.object_buttons:
             try:
-                current_obj_id = all_obj_ids[i] if i < len(all_obj_ids) else i
                 # recompute base color
-                color_rgb = tuple(map(int, self.colors[(current_obj_id + 1) % len(self.colors)]))
+                color_rgb = tuple(map(int, self.colors[(obj_id_stored + 1) % len(self.colors)]))
                 r, g, b = color_rgb
                 luminance = 0.299 * r + 0.587 * g + 0.114 * b
                 text_color = '#000000' if luminance > 180 else '#FFFFFF'
-                if current_obj_id == obj_id:
-                    # highlighted border
-                    btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; border: 3px solid #FFD700; border-radius: 15px;")
+                
+                if obj_id_stored == obj_id:
+                    # Highlight the selected button with golden border
+                    if mode == 1:  # + button selected
+                        btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border: 3px solid #FFD700; border-radius: 6px;")
+                        btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;")
+                    else:  # - button selected
+                        btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;")
+                        btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border: 3px solid #FFD700; border-radius: 6px;")
                 else:
-                    btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; border-radius: 6px;")
+                    # Not selected - normal style
+                    btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;")
+                    btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;")
             except Exception as e:
                 print(e)
                 pass

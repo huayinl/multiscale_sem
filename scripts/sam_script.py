@@ -114,9 +114,11 @@ def shrink_video(video_dir, save_dir):
         cropped_img = img[min_y0:max_y1, min_x0:max_x1]
         cv2.imwrite(save_fp, cropped_img)
 
+print("Setting up device...")
 device = setup()
 sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
 model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+print(f"Adding SAM 2 Video Predictor...")
 predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
 
 

@@ -1,6 +1,8 @@
 small_thumbnails_cropped
 small_thumbnails_cropped_masks
 ordered_thumbnails
+ordered_thumbnails_cropped
 small_thumbnails
 sam2_configs
 checkpoints
+.DS_Store
